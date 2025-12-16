@@ -1,250 +1,242 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PV Module Production vs (Domestic Installation + Exports) with Lead-Time Alignment
-===============================================================================
+PV Module Supply–Demand Alignment with Lead-Time Adjustment
+===========================================================
 
-This script reproduces the full analysis we discussed:
+This script reproduces the lead-time alignment analysis using machine-readable
+CSV inputs (stored under `data/raw/`). It compares:
 
-1) Inputs (annual):
-   - China PV module production (GW): P_y
-   - China PV module exports (GW):     E_y
-   - China PV PV installation (GW):    I_y  (newly grid-connected capacity)
+  Domestic available module supply  = Production − Exports   (annual, GW)
 
-2) We treat exports as "immediately absorbed" in the same calendar year, so the
-   annual domestic-available module supply is:
-        Supply_y = P_y - E_y
+against
 
-3) Installation does NOT consume modules instantaneously from the same-year supply.
-   Projects place module orders in advance. We model a fixed lead-time (L months)
-   between "module production/availability" and "project grid-connection".
+  Implied domestic module demand    = Installations shifted backward by L months
+                                      (annualized from monthly series, GW)
 
-   Operationally:
-   - Build a monthly installation series I_t by distributing each year's installation
-     across 12 months using quarterly weights inferred from cumulative quarterly data.
-   - Shift the monthly installation series backward by L months to represent the
-     implied monthly demand needed for those installations.
-   - Aggregate to annual implied demand:
-        ImpliedProd_y(L) = sum_{t in year y} I_{t+L}   (implemented via shift(-L))
+where L is a procurement & construction lead time (1–12 months).
 
-4) Grid search:
-   - Evaluate L = 1..12 months
-   - Evaluate model fit over years 2015–2023 (or 2016–2023 if you want to exclude 2015)
-   - Metrics: MAE, RMSE between Supply_y and ImpliedProd_y(L)
+Why lead time?
+--------------
+PV projects typically procure modules months before grid connection. Annual
+installation statistics therefore reflect demand with a delay relative to
+production and shipments. Introducing a lead time helps distinguish timing
+mismatches from structural overproduction at the module level.
 
-5) Outputs:
-   - Intermediate tables (CSV):
-       * input_annual_data.csv
-       * quarterly_cumulative_installation.csv
-       * quarterly_increments_and_shares.csv
-       * monthly_installation_series.csv
-       * grid_search_metrics_2015_2023.csv
-       * best_lead_timeseries_2015_2023.csv
-   - Figures (PNG):
-       * mae_grid_2015_2023.png
-       * rmse_grid_2015_2023.png
-       * supply_vs_implied_bestLead_2015_2023.png
-       * residual_share_bestLead_2015_2023.png
+Inputs (CSV)
+------------
+Expected files under `data/raw/` (filenames can be changed via CLI flags):
 
-Run:
-    python pv_lead_alignment_full.py
+- china_pv_module_production.csv
+    columns: year, production_gw, [source_url], [source_note]
 
-Dependencies:
-    pandas, numpy, matplotlib
+- china_pv_module_exports.csv
+    columns: year, export_gw, [source_url], [source_note]
+
+- china_pv_module_installation.csv
+    columns: year, installation_gw, [source_url], [source_note]
+
+- china_pv_installation_quarterly_cumulative.csv
+    columns: year, Q1_cum_gw, H1_cum_gw, Q3_cum_gw, Year_cum_gw, [source]
+
+Quarterly cumulative installation is used to infer intra-year seasonality. We
+assume installations are evenly distributed across months within each quarter.
+
+Outputs
+-------
+By default, outputs are written to:
+    data/output/<run_id>/
+
+where <run_id> is a timestamp (e.g., 2025-12-16_141530). This avoids accidental
+overwrites and makes results auditable.
+
+Exported artifacts include:
+- Intermediate tables (CSV):
+    * annual_inputs.csv
+    * quarterly_cumulative.csv
+    * quarterly_increments_and_shares.csv
+    * monthly_installations.csv
+    * grid_search_metrics_<start>_<end>.csv
+    * best_lead_timeseries_<start>_<end>.csv
+- Figures (PNG + PDF):
+    * mae_rmse_grid_<start>_<end>.{png,pdf}
+    * supply_vs_implied_demand_lead6_7_<start>_<end>.{png,pdf}
+    * supply_vs_implied_demand_bestLead_<start>_<end>.{png,pdf}
+    * residual_share_bestLead_<start>_<end>.{png,pdf}
+
+Usage
+-----
+Basic run (from repo root):
+    python PV_lead_alignment.py
+
+Common options:
+    python PV_lead_alignment.py --eval-start 2015 --eval-end 2023
+    python PV_lead_alignment.py --output-dir data/output --run-id my_test_run
+
+Dependencies
+------------
+pandas, numpy, matplotlib
 """
 
 from __future__ import annotations
+
+import argparse
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Dict, Tuple
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
 # -----------------------------
-# 0) Configuration
+# Plot defaults (publication-friendly)
 # -----------------------------
-OUTDIR = Path("./pv_lead_alignment_outputs")
-OUTDIR.mkdir(parents=True, exist_ok=True)
+FIGSIZE_2K = (10, 5.625)  # 2560x1440 when dpi=256
+DPI_2K = 256
 
-EVAL_START_YEAR = 2015   # set to 2016 if you want to exclude the "left-edge" year
-EVAL_END_YEAR   = 2023   # do NOT include 2024 in error evaluation (needs 2025 installs)
-LEAD_MIN = 1
-LEAD_MAX = 12
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
 
 
 # -----------------------------
-# 1) Raw Inputs (FINAL DATASET)
+# Data loading
 # -----------------------------
-# Production (Module) - GW
-PRODUCTION_GW = {
-    2015: 45.8,
-    2016: 53.7,
-    2017: 75.0,
-    2018: 85.7,
-    2019: 98.6,
-    2020: 124.6,
-    2021: 182.0,
-    2022: 288.7,
-    2023: 499.0,
-    2024: 588.0,
-}
+def load_inputs(raw_dir: Path,
+                production_file: str,
+                exports_file: str,
+                installation_file: str,
+                quarterly_file: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load annual and quarterly-cumulative inputs from CSV files.
 
-# Exports (Module) - GW
-EXPORT_GW = {
-    2015: 24.0,
-    2016: 21.3,
-    2017: 31.5,
-    2018: 41.6,
-    2019: 66.6,
-    2020: 78.8,
-    2021: 98.5,
-    2022: 153.0,
-    2023: 211.0,
-    2024: 238.8,
-}
+    Returns:
+      annual_df: columns
+          [year, production_gw, export_gw, installation_gw, supply_domestic_gw]
+      qcum_df: quarterly cumulative installation dataframe
+    """
 
-# Domestic installations (GW)
-INSTALL_GW = {
-    2015: 15.13,
-    2016: 34.54,
-    2017: 53.06,
-    2018: 44.26,
-    2019: 30.10,
-    2020: 48.20,
-    2021: 54.88,
-    2022: 87.408,
-    2023: 216.3,
-    2024: 277.57,
-}
+    # Read CSVs
+    prod = pd.read_csv(raw_dir / production_file)
+    exp = pd.read_csv(raw_dir / exports_file)
+    inst = pd.read_csv(raw_dir / installation_file)
+    qcum = pd.read_csv(raw_dir / quarterly_file)
 
-# Quarterly cumulative installation (GW): Q1 cum, H1 cum, Q3 cum, Full-year
-# These are the same values used earlier to infer intra-year seasonality.
-QUARTERLY_CUM_INSTALL_GW = {
-    2015: {"Q1_cum": 5.04,   "H1_cum": 7.73,    "Q3_cum": 9.90,    "Year_cum": 15.13},
-    2016: {"Q1_cum": 7.14,   "H1_cum": 13.01,   "Q3_cum": 26.00,   "Year_cum": 34.54},
-    2017: {"Q1_cum": 7.21,   "H1_cum": 24.40,   "Q3_cum": 42.00,   "Year_cum": 53.06},
-    2018: {"Q1_cum": 9.52,   "H1_cum": 24.306,  "Q3_cum": 34.544,  "Year_cum": 44.26},
-    2019: {"Q1_cum": 5.20,   "H1_cum": 11.40,   "Q3_cum": 15.99,   "Year_cum": 30.10},
-    2020: {"Q1_cum": 3.95,   "H1_cum": 11.52,   "Q3_cum": 18.70,   "Year_cum": 48.20},
-    2021: {"Q1_cum": 5.33,   "H1_cum": 13.01,   "Q3_cum": 25.556,  "Year_cum": 54.88},
-    2022: {"Q1_cum": 13.21,  "H1_cum": 30.878,  "Q3_cum": 52.602,  "Year_cum": 87.408},
-    2023: {"Q1_cum": 33.656, "H1_cum": 78.423,  "Q3_cum": 128.93,  "Year_cum": 216.30},
-    2024: {"Q1_cum": 45.74,  "H1_cum": 102.48,  "Q3_cum": 160.88,  "Year_cum": 277.57},
-}
+    # Standardize column names (defensive)
+    prod.columns = prod.columns.str.strip()
+    exp.columns = exp.columns.str.strip()
+    inst.columns = inst.columns.str.strip()
+    qcum.columns = qcum.columns.str.strip()
+
+    # ---- Column validation (explicit & readable) ----
+    required_prod = {"year", "production_gw"}
+    required_exp = {"year", "export_gw"}
+    required_inst = {"year", "installation_gw"}
+    required_q = {"year", "Q1_cum_gw", "H1_cum_gw", "Q3_cum_gw", "Year_cum_gw"}
+
+    if not required_prod.issubset(prod.columns):
+        raise ValueError(
+            f"{production_file} missing columns: "
+            f"{sorted(required_prod - set(prod.columns))}"
+        )
+
+    if not required_exp.issubset(exp.columns):
+        raise ValueError(
+            f"{exports_file} missing columns: "
+            f"{sorted(required_exp - set(exp.columns))}"
+        )
+
+    if not required_inst.issubset(inst.columns):
+        raise ValueError(
+            f"{installation_file} missing columns: "
+            f"{sorted(required_inst - set(inst.columns))}"
+        )
+
+    if not required_q.issubset(qcum.columns):
+        raise ValueError(
+            f"{quarterly_file} missing columns: "
+            f"{sorted(required_q - set(qcum.columns))}"
+        )
+
+    # ---- Merge annual data ----
+    annual = (
+        prod[["year", "production_gw"]]
+        .merge(exp[["year", "export_gw"]], on="year", how="inner")
+        .merge(inst[["year", "installation_gw"]], on="year", how="inner")
+        .sort_values("year")
+        .reset_index(drop=True)
+    )
+
+    annual["supply_domestic_gw"] = annual["production_gw"] - annual["export_gw"]
+
+    # Keep only needed columns for quarterly cumulative
+    qcum = (
+        qcum[["year", "Q1_cum_gw", "H1_cum_gw", "Q3_cum_gw", "Year_cum_gw"]]
+        .sort_values("year")
+        .reset_index(drop=True)
+    )
+
+    return annual, qcum
 
 
 # -----------------------------
-# 2) Utility: Build annual input table
+# Quarterly → monthly installation series
 # -----------------------------
-def build_annual_inputs() -> pd.DataFrame:
-    yrs = sorted(set(PRODUCTION_GW) & set(EXPORT_GW) & set(INSTALL_GW))
-    df = pd.DataFrame({
-        "year": yrs,
-        "production_gw": [PRODUCTION_GW[y] for y in yrs],
-        "export_gw":     [EXPORT_GW[y]     for y in yrs],
-        "install_gw":    [INSTALL_GW[y]    for y in yrs],
-    })
-    df["supply_domestic_gw"] = df["production_gw"] - df["export_gw"]  # P - E
+def quarterly_increments_and_shares(qcum_df: pd.DataFrame) -> pd.DataFrame:
+    df = qcum_df.copy()
+    df["Q1"] = df["Q1_cum_gw"]
+    df["Q2"] = df["H1_cum_gw"] - df["Q1_cum_gw"]
+    df["Q3"] = df["Q3_cum_gw"] - df["H1_cum_gw"]
+    df["Q4"] = df["Year_cum_gw"] - df["Q3_cum_gw"]
+
+    for q in ["Q1", "Q2", "Q3", "Q4"]:
+        df[f"{q}_share"] = df[q] / df["Year_cum_gw"]
     return df
 
 
-# -----------------------------
-# 3) Utility: Quarterly -> monthly installation series
-# -----------------------------
-def build_quarterly_tables() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-      qcum_df: quarterly cumulative values as provided
-      qinc_df: quarterly increments and quarterly shares
-    """
-    yrs = sorted(QUARTERLY_CUM_INSTALL_GW.keys())
-    qcum_df = pd.DataFrame([{"year": y, **QUARTERLY_CUM_INSTALL_GW[y]} for y in yrs])
-
-    # Increments
-    qinc_df = qcum_df.copy()
-    qinc_df["Q1"] = qinc_df["Q1_cum"]
-    qinc_df["Q2"] = qinc_df["H1_cum"] - qinc_df["Q1_cum"]
-    qinc_df["Q3"] = qinc_df["Q3_cum"] - qinc_df["H1_cum"]
-    qinc_df["Q4"] = qinc_df["Year_cum"] - qinc_df["Q3_cum"]
-
-    # Shares
-    for q in ["Q1", "Q2", "Q3", "Q4"]:
-        qinc_df[f"{q}_share"] = qinc_df[q] / qinc_df["Year_cum"]
-
-    return qcum_df, qinc_df
-
-
-def build_monthly_installation(qinc_df: pd.DataFrame) -> pd.Series:
-    """
-    Construct monthly installation series from quarterly shares.
-
-    Assumption:
-      - Within each quarter, installation is evenly split across 3 months.
-      - For each year y:
-          Jan-Mar share = Q1_share / 3 each month
-          Apr-Jun share = Q2_share / 3 each month
-          Jul-Sep share = Q3_share / 3 each month
-          Oct-Dec share = Q4_share / 3 each month
-
-    Output:
-      pd.Series indexed by month-start timestamps, values in GW.
-    """
-    start = f"{qinc_df['year'].min()}-01-01"
-    end   = f"{qinc_df['year'].max()}-12-01"
+def build_monthly_installations(qinc_df: pd.DataFrame) -> pd.Series:
+    start = f"{int(qinc_df['year'].min())}-01-01"
+    end = f"{int(qinc_df['year'].max())}-12-01"
     months = pd.date_range(start, end, freq="MS")
-
     inst = pd.Series(index=months, dtype=float)
 
     for _, row in qinc_df.iterrows():
         y = int(row["year"])
         weights = np.array(
-            [row["Q1_share"]/3]*3 +
-            [row["Q2_share"]/3]*3 +
-            [row["Q3_share"]/3]*3 +
-            [row["Q4_share"]/3]*3
+            [row["Q1_share"] / 3] * 3 +
+            [row["Q2_share"] / 3] * 3 +
+            [row["Q3_share"] / 3] * 3 +
+            [row["Q4_share"] / 3] * 3
         )
-        year_total = float(row["Year_cum"])
         idx = pd.date_range(f"{y}-01-01", f"{y}-12-01", freq="MS")
-        inst.loc[idx] = year_total * weights
+        inst.loc[idx] = float(row["Year_cum_gw"]) * weights
 
     return inst
 
 
 # -----------------------------
-# 4) Lead alignment: implied demand from shifted installation
+# Lead alignment: implied annual demand
 # -----------------------------
 def implied_demand_annual(inst_monthly: pd.Series, lead_months: int) -> pd.Series:
     """
-    Shift monthly installation backward by lead_months to represent implied demand.
+    Shift monthly installations backward by lead_months to represent implied demand timing.
 
-    Implementation note:
-      - pandas shift(k) moves values forward in time if k > 0.
-      - We want ImpliedProd at time t to correspond to installations at t+lead.
-        Therefore we use shift(-lead).
-
-    Edge handling:
-      - If a calendar year contains ANY NaNs after shifting (because we ran out of future months),
-        that year's implied demand is set to NaN and dropped.
-
-    Returns:
-      pd.Series indexed by year with implied demand(GW).
+    We use shift(-lead) such that implied demand in month t corresponds to installations at t+lead.
+    Annual aggregation is strict: if any shifted month in a year is missing (NaN), that year is dropped.
     """
     shifted = inst_monthly.shift(-lead_months)
 
     def year_sum_strict(x: pd.Series) -> float:
-        # if any month is missing, year cannot be fully computed (avoids right-edge bias)
         return np.nan if x.isna().any() else float(x.sum())
 
     annual = shifted.groupby(shifted.index.year).agg(year_sum_strict).dropna()
-    annual.name = f"implied_prod_lead_{lead_months}"
+    annual.name = f"implied_demand_lead_{lead_months}_gw"
     return annual
 
 
-# -----------------------------
-# 5) Fit metrics
-# -----------------------------
 @dataclass
 class FitResult:
     lead_months: int
@@ -253,14 +245,11 @@ class FitResult:
     n_years: int
 
 
-def compute_metrics_for_lead(annual_df: pd.DataFrame, inst_monthly: pd.Series, lead: int,
-                             start_year: int, end_year: int) -> tuple[FitResult, pd.DataFrame]:
-    """
-    Compare Supply_y = (P-E) with ImpliedProd_y(lead) over [start_year, end_year].
-
-    Returns:
-      FitResult and a detailed dataframe containing year-by-year values.
-    """
+def compute_metrics_for_lead(annual_df: pd.DataFrame,
+                             inst_monthly: pd.Series,
+                             lead: int,
+                             start_year: int,
+                             end_year: int) -> Tuple[FitResult, pd.DataFrame]:
     implied = implied_demand_annual(inst_monthly, lead)
 
     df = annual_df.merge(implied.rename("implied_demand_gw"), left_on="year", right_index=True, how="left")
@@ -276,14 +265,14 @@ def compute_metrics_for_lead(annual_df: pd.DataFrame, inst_monthly: pd.Series, l
     return FitResult(lead, mae, rmse, n), df_eval
 
 
-def grid_search(annual_df: pd.DataFrame, inst_monthly: pd.Series,
-                lead_min: int, lead_max: int,
-                start_year: int, end_year: int) -> tuple[pd.DataFrame, dict[int, pd.DataFrame]]:
-    """
-    Run lead = lead_min..lead_max, collect MAE/RMSE and store year-by-year tables.
-    """
+def grid_search(annual_df: pd.DataFrame,
+                inst_monthly: pd.Series,
+                lead_min: int,
+                lead_max: int,
+                start_year: int,
+                end_year: int) -> Tuple[pd.DataFrame, Dict[int, pd.DataFrame]]:
     metrics = []
-    detail_tables: dict[int, pd.DataFrame] = {}
+    details: Dict[int, pd.DataFrame] = {}
 
     for lead in range(lead_min, lead_max + 1):
         fit, detail = compute_metrics_for_lead(annual_df, inst_monthly, lead, start_year, end_year)
@@ -293,190 +282,208 @@ def grid_search(annual_df: pd.DataFrame, inst_monthly: pd.Series,
             "rmse_gw": fit.rmse_gw,
             "n_years": fit.n_years,
         })
-        detail_tables[lead] = detail
+        details[lead] = detail
 
     metrics_df = pd.DataFrame(metrics).sort_values("lead_months").reset_index(drop=True)
-    return metrics_df, detail_tables
+    return metrics_df, details
 
 
 # -----------------------------
-# 6) Plotting helpers
+# Plotting helpers
 # -----------------------------
-def plot_supply_vs_implied_lead6_7(
-        detail_6: pd.DataFrame,
-        detail_7: pd.DataFrame,
-        outfile: Path,
-        title: str
-):
-    """
-    Plot domestic supply (P − E) and implied demand under Lead = 6 and Lead = 7
-    on the same figure.
-    """
-    plt.figure(figsize=(10, 5.625), dpi=256)
-    # Domestic available supply (same for both leads)
-    plt.plot(
-        detail_6["year"],
-        detail_6["supply_domestic_gw"],
-        color="gray",
-        linewidth=2,
-        marker="o",
-        label="Domestic supply (P − E)"
-    )
+def save_png_pdf(basepath: Path):
+    """Helper to return .png and .pdf paths from a base path without suffix."""
+    return basepath.with_suffix(".png"), basepath.with_suffix(".pdf")
 
-    # Implied demand: Lead = 6
-    plt.plot(
-        detail_6["year"],
-        detail_6["implied_demand_gw"],
-        linestyle="--",
-        marker="s",
-        label="Implied demand (Lead = 6 months)"
-    )
 
-    # Implied demand: Lead = 7
-    plt.plot(
-        detail_7["year"],
-        detail_7["implied_demand_gw"],
-        linestyle=":",
-        marker="^",
-        label="Implied demand (Lead = 7 months)"
-    )
+def plot_mae_rmse_together(metrics_df: pd.DataFrame, outbase: Path, title: str, mark_leads=(6, 7)):
+    plt.figure(figsize=FIGSIZE_2K, dpi=DPI_2K)
+    plt.plot(metrics_df["lead_months"], metrics_df["mae_gw"], marker="o", label="MAE (GW)")
+    plt.plot(metrics_df["lead_months"], metrics_df["rmse_gw"], marker="s", label="RMSE (GW)")
+
+    # Optional vertical reference lines
+    for L in mark_leads:
+        plt.axvline(L, linestyle="--", linewidth=1, alpha=0.6, label=f"Lead = {L} months")
+
+    plt.xlabel("Lead (months)")
+    plt.ylabel("Error (GW)")
+    plt.title(title)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+
+    png, pdf = save_png_pdf(outbase)
+    plt.savefig(png, dpi=DPI_2K)
+    plt.savefig(pdf)
+    plt.close()
+
+
+def plot_supply_vs_implied(detail_df: pd.DataFrame, lead: int, outbase: Path, title: str):
+    plt.figure(figsize=FIGSIZE_2K, dpi=DPI_2K)
+    plt.plot(detail_df["year"], detail_df["supply_domestic_gw"], marker="o", linewidth=2, color="black",
+             label="Domestic available supply (P − E)")
+    plt.plot(detail_df["year"], detail_df["implied_demand_gw"], marker="s",
+             label=f"Implied module demand (Lead = {lead} months)")
 
     plt.xlabel("Year")
     plt.ylabel("GW")
     plt.title(title)
     plt.legend()
     plt.grid(alpha=0.3)
-
     plt.tight_layout()
-    plt.savefig(outfile.with_suffix(".png"), dpi=256)
-    plt.savefig(outfile.with_suffix(".pdf"))
+
+    png, pdf = save_png_pdf(outbase)
+    plt.savefig(png, dpi=DPI_2K)
+    plt.savefig(pdf)
     plt.close()
 
 
+def plot_supply_vs_implied_lead6_7(detail_6: pd.DataFrame, detail_7: pd.DataFrame, outbase: Path, title: str):
+    plt.figure(figsize=FIGSIZE_2K, dpi=DPI_2K)
+    # Supply line (same years)
+    plt.plot(detail_6["year"], detail_6["supply_domestic_gw"], marker="o", linewidth=2, color="black",
+             label="Domestic available supply (P − E)")
+    # Lead 6 and lead 7 implied demand
+    plt.plot(detail_6["year"], detail_6["implied_demand_gw"], linestyle="--", marker="s",
+             label="Implied module demand (Lead = 6 months)")
+    plt.plot(detail_7["year"], detail_7["implied_demand_gw"], linestyle=":", marker="^",
+             label="Implied module demand (Lead = 7 months)")
 
-def plot_residual_share(detail_df: pd.DataFrame, lead: int, outfile: Path, title_suffix: str):
-    # residual share = residual / (P-E)
-    plt.figure(figsize=(10, 5.625), dpi=256)
-    plt.rcParams["pdf.fonttype"] = 42   # TrueType
-    plt.rcParams["ps.fonttype"] = 42
+    plt.xlabel("Year")
+    plt.ylabel("GW")
+    plt.title(title)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
 
+    png, pdf = save_png_pdf(outbase)
+    plt.savefig(png, dpi=DPI_2K)
+    plt.savefig(pdf)
+    plt.close()
+
+
+def plot_residual_share(detail_df: pd.DataFrame, outbase: Path, title: str):
     rs = detail_df["residual_gw"] / detail_df["supply_domestic_gw"]
+    plt.figure(figsize=FIGSIZE_2K, dpi=DPI_2K)
     plt.plot(detail_df["year"], rs, marker="o")
     plt.axhline(0, linestyle="--", linewidth=1)
     plt.xlabel("Year")
     plt.ylabel("Residual / (P − E)")
-    plt.title(f"Residual Share {title_suffix}")
-    plt.tight_layout()
-    plt.savefig(outfile.with_suffix(".png"), dpi=256)
-    plt.savefig(outfile.with_suffix(".pdf"))
-    plt.close()
-
-def plot_mae_rmse_together(metrics_df: pd.DataFrame, outfile: Path, title: str):
-    """
-    Plot MAE and RMSE curves on the same figure.
-    """
-    plt.figure(figsize=(10, 5.625), dpi=256)
-    plt.rcParams["pdf.fonttype"] = 42   # TrueType
-    plt.rcParams["ps.fonttype"] = 42
-
-    # --- 1. 画 MAE ---
-    plt.plot(
-        metrics_df["lead_months"],
-        metrics_df["mae_gw"],
-        marker="o",
-        label="MAE (GW)"
-    )
-
-    # --- 2. 画 RMSE ---
-    plt.plot(
-        metrics_df["lead_months"],
-        metrics_df["rmse_gw"],
-        marker="s",
-        label="RMSE (GW)"
-    )
-
-    # === Option A：就在这里加 ===
-    plt.axvline(6, linestyle="--", linewidth=1, alpha=0.6, label="Lead = 6 months")
-    plt.axvline(7, linestyle="--", linewidth=1, alpha=0.6, label="Lead = 7 months")
-
-    # --- 3. 坐标轴 & 标题 ---
-    plt.xlabel("Lead (months)")
-    plt.ylabel("Error (GW)")
     plt.title(title)
-
-    # --- 4. 图例 ---
-    plt.legend()
-
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(outfile.with_suffix(".png"), dpi=256)
-    plt.savefig(outfile.with_suffix(".pdf"))
+
+    png, pdf = save_png_pdf(outbase)
+    plt.savefig(png, dpi=DPI_2K)
+    plt.savefig(pdf)
     plt.close()
 
+
 # -----------------------------
-# 7) Main pipeline
+# Main pipeline
 # -----------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="PV module supply–demand lead-time alignment (CSV-driven).")
+    p.add_argument("--raw-dir", default="data/raw", help="Directory containing input CSV files (default: data/raw).")
+    p.add_argument("--output-dir", default="data/output", help="Base output directory (default: data/output).")
+    p.add_argument("--run-id", default=None, help="Optional run ID subfolder name. Default: timestamp.")
+    p.add_argument("--eval-start", type=int, default=2015, help="Evaluation start year (default: 2015).")
+    p.add_argument("--eval-end", type=int, default=2023, help="Evaluation end year (default: 2023).")
+    p.add_argument("--lead-min", type=int, default=1, help="Minimum lead time in months (default: 1).")
+    p.add_argument("--lead-max", type=int, default=12, help="Maximum lead time in months (default: 12).")
+
+    p.add_argument("--production-file", default="china_pv_module_production.csv")
+    p.add_argument("--exports-file", default="china_pv_module_exports.csv")
+    p.add_argument("--installation-file", default="china_pv_module_installation.csv")
+    p.add_argument("--quarterly-file", default="china_pv_installation_quarterly_cumulative.csv")
+    return p.parse_args()
+
+
 def main():
-    # 7.1 Build annual input table
-    annual_df = build_annual_inputs()
-    annual_df.to_csv(OUTDIR / "input_annual_data.csv", index=False)
+    args = parse_args()
 
-    # 7.2 Quarterly tables (cumulative + increments/shares)
-    qcum_df, qinc_df = build_quarterly_tables()
-    qcum_df.to_csv(OUTDIR / "quarterly_cumulative_installation.csv", index=False)
-    qinc_df.to_csv(OUTDIR / "quarterly_increments_and_shares.csv", index=False)
+    raw_dir = Path(args.raw_dir)
+    if not raw_dir.exists():
+        raise FileNotFoundError(f"Raw data directory not found: {raw_dir.resolve()}")
 
-    # 7.3 Monthly installation series
-    inst_monthly = build_monthly_installation(qinc_df)
-    inst_monthly.to_frame("monthly_installation_gw").to_csv(OUTDIR / "monthly_installation_series.csv")
+    run_id = args.run_id or datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    outdir = Path(args.output_dir) / run_id
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    # 7.4 Grid search over lead
+    # 1) Load
+    annual_df, qcum_df = load_inputs(
+        raw_dir=raw_dir,
+        production_file=args.production_file,
+        exports_file=args.exports_file,
+        installation_file=args.installation_file,
+        quarterly_file=args.quarterly_file,
+    )
+
+    # Save annual inputs for transparency
+    annual_df.to_csv(outdir / "annual_inputs.csv", index=False)
+    qcum_df.to_csv(outdir / "quarterly_cumulative.csv", index=False)
+
+    # 2) Quarterly → increments & shares
+    qinc_df = quarterly_increments_and_shares(qcum_df)
+    qinc_df.to_csv(outdir / "quarterly_increments_and_shares.csv", index=False)
+
+    # 3) Monthly installations
+    inst_monthly = build_monthly_installations(qinc_df)
+    inst_monthly.to_frame("monthly_installation_gw").to_csv(outdir / "monthly_installations.csv")
+
+    # 4) Grid search
     metrics_df, detail_tables = grid_search(
         annual_df=annual_df,
         inst_monthly=inst_monthly,
-        lead_min=LEAD_MIN,
-        lead_max=LEAD_MAX,
-        start_year=EVAL_START_YEAR,
-        end_year=EVAL_END_YEAR
+        lead_min=args.lead_min,
+        lead_max=args.lead_max,
+        start_year=args.eval_start,
+        end_year=args.eval_end,
     )
-    metrics_df.to_csv(OUTDIR / f"grid_search_metrics_{EVAL_START_YEAR}_{EVAL_END_YEAR}.csv", index=False)
+    metrics_df.to_csv(outdir / f"grid_search_metrics_{args.eval_start}_{args.eval_end}.csv", index=False)
 
-    # 7.5 Identify best lead (by RMSE)
+    # 5) Best lead (by RMSE)
     best_row = metrics_df.loc[metrics_df["rmse_gw"].idxmin()]
     best_lead = int(best_row["lead_months"])
     best_detail = detail_tables[best_lead].copy()
-    best_detail.to_csv(OUTDIR / f"best_lead_timeseries_{EVAL_START_YEAR}_{EVAL_END_YEAR}.csv", index=False)
+    best_detail.to_csv(outdir / f"best_lead_timeseries_{args.eval_start}_{args.eval_end}.csv", index=False)
 
-
-    # 7.6 Plot MAE & RMSE together
+    # 6) Plots
     plot_mae_rmse_together(
         metrics_df,
-        outfile=OUTDIR / f"mae_rmse_grid_{EVAL_START_YEAR}_{EVAL_END_YEAR}.png",
-        title=f"Lead Grid Search ({EVAL_START_YEAR}–{EVAL_END_YEAR}): MAE & RMSE"
+        outbase=outdir / f"mae_rmse_grid_{args.eval_start}_{args.eval_end}",
+        title=f"Lead Grid Search ({args.eval_start}–{args.eval_end}): MAE & RMSE",
+        mark_leads=(6, 7),
     )
 
-    # 7.7 Plot best-lead fits
-    detail_6 = detail_tables[6]
-    detail_7 = detail_tables[7]
+    # Lead 6 & 7 overlay (if available)
+    if 6 in detail_tables and 7 in detail_tables:
+        plot_supply_vs_implied_lead6_7(
+            detail_tables[6],
+            detail_tables[7],
+            outbase=outdir / f"supply_vs_implied_demand_lead6_7_{args.eval_start}_{args.eval_end}",
+            title="Domestic Supply (P − E) vs Implied Module Demand (Lead = 6 and 7 months)"
+        )
 
-    plot_supply_vs_implied_lead6_7(
-        detail_6=detail_6,
-        detail_7=detail_7,
-        outfile=OUTDIR / "supply_vs_implied_lead6_lead7_2015_2023",
-        title="China PV Module Supply vs Implied Domestic Demand under Different Lead Times"
+    # Best-lead plot and residual share
+    plot_supply_vs_implied(
+        best_detail,
+        best_lead,
+        outbase=outdir / f"supply_vs_implied_demand_bestLead_{args.eval_start}_{args.eval_end}",
+        title=f"Domestic Supply (P − E) vs Implied Module Demand (Best RMSE: Lead = {best_lead} months)"
     )
 
     plot_residual_share(
-        best_detail, best_lead,
-        outfile=OUTDIR / f"residual_share_bestLead_{EVAL_START_YEAR}_{EVAL_END_YEAR}.png",
-        title_suffix=f"(Best RMSE: Lead={best_lead}, {EVAL_START_YEAR}–{EVAL_END_YEAR})"
+        best_detail,
+        outbase=outdir / f"residual_share_bestLead_{args.eval_start}_{args.eval_end}",
+        title=f"Residual Share under Best Lead (Lead = {best_lead} months, {args.eval_start}–{args.eval_end})"
     )
 
-    # 7.8 Print a short console summary
-    print("=== Grid Search Summary ===")
+    # Console summary
+    print("=== Grid Search Metrics ===")
     print(metrics_df.to_string(index=False))
-    print("\nBest lead by RMSE:", best_lead)
-    print("Outputs saved to:", OUTDIR.resolve())
+    print(f"\nBest lead by RMSE: {best_lead} months")
+    print(f"Outputs written to: {outdir.resolve()}")
 
 
 if __name__ == "__main__":
