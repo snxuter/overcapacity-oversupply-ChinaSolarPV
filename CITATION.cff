@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+title: "Supply–Demand Alignment of China’s Solar PV Modules with Lead-Time Adjustment"
+message: >
+  If you use this repository or its results in academic, policy, or analytical
+  work, please cite it as below.
+type: software
+authors:
+  - family-names: Xu
+    given-names: Shengnian
+    affiliation: World Resources Institute (WRI)
+repository-code: "https://github.com/snxuter/overcapacity-oversupply-ChinaSolarPV"
+url: "https://github.com/snxuter/overcapacity-oversupply-ChinaSolarPV"
+abstract: >
+  This repository provides an applied analysis of the apparent mismatch between
+  solar PV module production and installations in China. By explicitly accounting
+  for procurement and construction lead times, the analysis shows that much of the
+  perceived overproduction at the module level reflects timing differences rather
+  than structural oversupply. The repository includes code, machine-readable input
+  data, and reproducible figures supporting policy and market analysis.
+keywords:
+  - solar photovoltaics
+  - China
+  - overcapacity
+  - supply chains
+  - energy transition
+  - lead time
+license: MIT
