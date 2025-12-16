@@ -1,51 +1,55 @@
-PV Module Production vs (Domestic Installation + Exports) with Lead-Time Alignment
-===============================================================================
+# PV Module Supply–Demand Alignment (China)
 
-This script reproduces the full analysis we discussed:
+**Why does China’s solar PV manufacturing look “overbuilt” in annual statistics, even when installations remain strong?**  
+This repository shows that much of the apparent mismatch reflects **timing**, not structural overproduction.
 
-1) Inputs (annual):
-   - China PV module production (GW): P_y
-   - China PV module exports (GW):     E_y
-   - China PV PV installation (GW):    I_y  (newly grid-connected capacity)
+By accounting for a realistic **project procurement and construction lead time**, China’s PV module production closely aligns with **domestic installations plus exports**.
 
-2) We treat exports as "immediately absorbed" in the same calendar year, so the
-   annual domestic-available module supply is:
-        Supply_y = P_y - E_y
+---
 
-3) Installation does NOT consume modules instantaneously from the same-year supply.
-   Projects place module orders in advance. We model a fixed lead-time (L months)
-   between "module production/availability" and "project grid-connection".
+## Key Insight
 
-   Operationally:
-   - Build a monthly installation series I_t by distributing each year's installation
-     across 12 months using quarterly weights inferred from cumulative quarterly data.
-   - Shift the monthly installation series backward by L months to represent the
-     implied monthly demand needed for those installations.
-   - Aggregate to annual implied demand:
-        ImpliedProd_y(L) = sum_{t in year y} I_{t+L}   (implemented via shift(-L))
+📌 **A 6–7 month lead time best explains the alignment between supply and demand.**
 
-4) Grid search:
-   - Evaluate L = 1..12 months
-   - Evaluate model fit over years 2015–2023 (or 2016–2023 if you want to exclude 2015)
-   - Metrics: MAE, RMSE between Supply_y and ImpliedProd_y(L)
+Once this timing is considered:
+- Apparent overproduction at the **module** level largely disappears
+- Residuals fluctuate around zero, with no evidence of persistent excess stock
+- The inferred lead time matches real-world PV project cycles in China
 
-5) Outputs:
-   - Intermediate tables (CSV):
-       * input_annual_data.csv
-       * quarterly_cumulative_installation.csv
-       * quarterly_increments_and_shares.csv
-       * monthly_installation_series.csv
-       * grid_search_metrics_2015_2023.csv
-       * best_lead_timeseries_2015_2023.csv
-   - Figures (PNG):
-       * mae_grid_2015_2023.png
-       * rmse_grid_2015_2023.png
-       * supply_vs_implied_bestLead_2015_2023.png
-       * residual_share_bestLead_2015_2023.png
+---
 
-Run:
-    python pv_lead_alignment_full.py
+## What This Repo Does
 
-Dependencies:
-    pandas, numpy, matplotlib
-"""
+**Data → Timing → Insight**
+
+1. **Domestic supply**  
+   PV module production − exports
+
+2. **Implied demand**  
+   Installations distributed monthly → shifted backward by 1–12 months
+
+3. **Grid search**  
+   Identify the lead time that minimizes MAE & RMSE (2015–2023)
+
+📊 Outputs include:
+- Lead-time error curves (MAE & RMSE)
+- Supply vs. implied demand (Lead = 6 & 7 months)
+- Residuals as a share of supply
+
+---
+
+## Data Sources
+
+- **Production:** China Photovoltaic Industry Association (CPIA)  
+- **Exports:** CPIA, CCCME, Eastmoney securities research  
+- **Installations:** National Energy Administration (NEA)
+
+All data are publicly available and expressed in GW.
+
+---
+
+## Quick Start
+
+```bash
+pip install pandas numpy matplotlib
+python PV_lead_alignment.py
