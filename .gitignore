@@ -1,0 +1,8 @@
+# Outputs only
+data/output/
+tmp/
+tmp_local_backup/
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
